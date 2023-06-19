@@ -118,10 +118,11 @@ class nnUNetTrainerV2(nnUNetTrainer):
             else:
                 pass
 
-            self.initialize_network()
+            # self.initialize_network()
+            from nnunet.network_architecture.static_UNet import Static_UNet
+            self.network = Static_UNet(num_classes=self.num_classes, in_channels=self.num_input_channels).to('cuda')
             self.initialize_optimizer_and_scheduler()
-
-            assert isinstance(self.network, (SegmentationNetwork, nn.DataParallel))
+            # assert isinstance(self.network, (SegmentationNetwork, nn.DataParallel))
         else:
             self.print_to_log_file('self.was_initialized is True, not running self.initialize again')
         self.was_initialized = True

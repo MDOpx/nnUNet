@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+nnUNet_raw_data_base
+nnUNet_preprocessed
+nnUNet_trained_models
+
 # C extensions
 *.so
 

@@ -205,6 +205,10 @@ class DataLoader3D(SlimDataLoaderBase):
         return not batch_idx < round(self.batch_size * (1 - self.oversample_foreground_percent))
 
     def determine_shapes(self):
+        self.manual_setting = True
+        self.positive_size = 1
+        self.negative_size = 1
+        
         if self.has_prev_stage:
             num_seg = 2
         else:
@@ -216,15 +220,74 @@ class DataLoader3D(SlimDataLoaderBase):
         else:
             case_all_data = np.load(self._data[k]['data_file'])['data']
         num_color_channels = case_all_data.shape[0] - 1
-        data_shape = (self.batch_size, num_color_channels, *self.patch_size)
-        seg_shape = (self.batch_size, num_seg, *self.patch_size)
+        # data_shape = (self.batch_size, num_color_channels, *self.patch_size)
+        # seg_shape = (self.batch_size, num_seg, *self.patch_size)
+        # if int(self.batch_size/(self.positive_size+self.negative_size))*(self.positive_size+self.negative_size) < self.positive_size+self.negative_size:
+        #     self.modified_batch_size = self.positive_size+self.negative_size
+        # else:
+        #     self.modified_batch_size = int(self.batch_size/(self.positive_size+self.negative_size))*(self.positive_size+self.negative_size)
+        
+        if self.manual_setting:        
+            self.modified_batch_size = int(self.batch_size/(self.positive_size+self.negative_size))
+            if self.modified_batch_size < 1: self.modified_batch_size = 1
+            
+            data_shape = (self.modified_batch_size*(self.positive_size+self.negative_size), num_color_channels, *self.patch_size)
+            seg_shape = (self.modified_batch_size*(self.positive_size+self.negative_size), num_seg, *self.patch_size)
+        else:
+            data_shape = (self.batch_size, *self.patch_size)
+            seg_shape = (self.batch_size, num_seg, *self.patch_size)
+
         return data_shape, seg_shape
 
+    def crop_and_padding(self, case_all_data, shape, selected_position):
+        bbox_x_lb = selected_position[0]
+        bbox_x_ub = bbox_x_lb + self.patch_size[0]
+        bbox_y_lb = selected_position[1]
+        bbox_y_ub = bbox_y_lb + self.patch_size[1]
+        bbox_z_lb = selected_position[2]
+        bbox_z_ub = bbox_z_lb + self.patch_size[2]
+        # whoever wrote this knew what he was doing (hint: it was me). We first crop the data to the region of the
+        # bbox that actually lies within the data. This will result in a smaller array which is then faster to pad.
+        # valid_bbox is just the coord that lied within the data cube. It will be padded to match the patch size
+        # later
+        valid_bbox_x_lb = max(0, bbox_x_lb)
+        valid_bbox_x_ub = min(shape[0], bbox_x_ub)
+        valid_bbox_y_lb = max(0, bbox_y_lb)
+        valid_bbox_y_ub = min(shape[1], bbox_y_ub)
+        valid_bbox_z_lb = max(0, bbox_z_lb)
+        valid_bbox_z_ub = min(shape[2], bbox_z_ub)
+
+        # At this point you might ask yourself why we would treat seg differently from seg_from_previous_stage.
+        # Why not just concatenate them here and forget about the if statements? Well that's because segneeds to
+        # be padded with -1 constant whereas seg_from_previous_stage needs to be padded with 0s (we could also
+        # remove label -1 in the data augmentation but this way it is less error prone)
+        case_all_data = np.copy(case_all_data[:, valid_bbox_x_lb:valid_bbox_x_ub,
+                                valid_bbox_y_lb:valid_bbox_y_ub,
+                                valid_bbox_z_lb:valid_bbox_z_ub])
+
+        data = np.pad(case_all_data[:-1], ((0, 0),
+                                            (-min(0, bbox_x_lb), max(bbox_x_ub - shape[0], 0)),
+                                            (-min(0, bbox_y_lb), max(bbox_y_ub - shape[1], 0)),
+                                            (-min(0, bbox_z_lb), max(bbox_z_ub - shape[2], 0))),
+                        self.pad_mode, **self.pad_kwargs_data)
+
+        seg = np.pad(case_all_data[-1:], ((0, 0),
+                                                (-min(0, bbox_x_lb), max(bbox_x_ub - shape[0], 0)),
+                                                (-min(0, bbox_y_lb), max(bbox_y_ub - shape[1], 0)),
+                                                (-min(0, bbox_z_lb), max(bbox_z_ub - shape[2], 0))),
+                        'constant', **{'constant_values': -1})
+        return data, seg
+    
     def generate_train_batch(self):
-        selected_keys = np.random.choice(self.list_of_keys, self.batch_size, True, None)
+        
+        if self.manual_setting:        
+            selected_keys = np.random.choice(self.list_of_keys, self.modified_batch_size, True, None)
+        else:
+            selected_keys = np.random.choice(self.list_of_keys, self.batch_size, True, None)
         data = np.zeros(self.data_shape, dtype=np.float32)
         seg = np.zeros(self.seg_shape, dtype=np.float32)
         case_properties = []
+        batch_idx = 0
         for j, i in enumerate(selected_keys):
             # oversampling foreground will improve stability of model training, especially if many patches are empty
             # (Lung for example)
@@ -289,92 +352,160 @@ class DataLoader3D(SlimDataLoaderBase):
             lb_z = - need_to_pad[2] // 2
             ub_z = shape[2] + need_to_pad[2] // 2 + need_to_pad[2] % 2 - self.patch_size[2]
 
-            # if not force_fg then we can just sample the bbox randomly from lb and ub. Else we need to make sure we get
-            # at least one of the foreground classes in the patch
-            if not force_fg:
-                bbox_x_lb = np.random.randint(lb_x, ub_x + 1)
-                bbox_y_lb = np.random.randint(lb_y, ub_y + 1)
-                bbox_z_lb = np.random.randint(lb_z, ub_z + 1)
-            else:
-                # these values should have been precomputed
-                if 'class_locations' not in properties.keys():
-                    raise RuntimeError("Please rerun the preprocessing with the newest version of nnU-Net!")
-
-                # this saves us a np.unique. Preprocessing already did that for all cases. Neat.
+            if self.manual_setting:
+                import random
+                # Label 위치 정보 
                 foreground_classes = np.array(
-                    [i for i in properties['class_locations'].keys() if len(properties['class_locations'][i]) != 0])
+                        [i for i in properties['class_locations'].keys() if len(properties['class_locations'][i]) != 0])
                 foreground_classes = foreground_classes[foreground_classes > 0]
+                selected_class = np.random.choice(foreground_classes)
+                voxels_of_that_class = properties['class_locations'][selected_class]
+                x_max = np.max([coord[0] for coord in voxels_of_that_class])
+                x_min = np.min([coord[0] for coord in voxels_of_that_class])
+                y_max = np.max([coord[1] for coord in voxels_of_that_class])
+                y_min = np.min([coord[1] for coord in voxels_of_that_class])
+                z_max = np.max([coord[2] for coord in voxels_of_that_class])
+                z_min = np.min([coord[2] for coord in voxels_of_that_class])
+                
+                def is_between(target, min, max, patch_size): #check
+                    return (min < target + patch_size/2 and target + patch_size/2 < max)
+                    #return (min < target and target + patch_size < max)
 
-                if len(foreground_classes) == 0:
-                    # this only happens if some image does not contain foreground voxels at all
-                    selected_class = None
-                    voxels_of_that_class = None
-                    print('case does not contain any foreground classes', i)
-                else:
-                    selected_class = np.random.choice(foreground_classes)
-
-                    voxels_of_that_class = properties['class_locations'][selected_class]
-
-                if voxels_of_that_class is not None:
-                    selected_voxel = voxels_of_that_class[np.random.choice(len(voxels_of_that_class))]
-                    # selected voxel is center voxel. Subtract half the patch size to get lower bbox voxel.
-                    # Make sure it is within the bounds of lb and ub
-                    bbox_x_lb = max(lb_x, selected_voxel[0] - self.patch_size[0] // 2)
-                    bbox_y_lb = max(lb_y, selected_voxel[1] - self.patch_size[1] // 2)
-                    bbox_z_lb = max(lb_z, selected_voxel[2] - self.patch_size[2] // 2)
-                else:
-                    # If the image does not contain any foreground classes, we fall back to random cropping
+                # Positive & Negative Patch        
+                positive_selected = []
+                negative_selected = []
+                cnt=0
+                while len(negative_selected) < self.negative_size:
                     bbox_x_lb = np.random.randint(lb_x, ub_x + 1)
                     bbox_y_lb = np.random.randint(lb_y, ub_y + 1)
                     bbox_z_lb = np.random.randint(lb_z, ub_z + 1)
+                    cnt = cnt + 1
+                    if cnt > 100:
+                        print(f'ERROR: n repeated {cnt} {len(negative_selected)}/{self.negative_size}')
 
-            bbox_x_ub = bbox_x_lb + self.patch_size[0]
-            bbox_y_ub = bbox_y_lb + self.patch_size[1]
-            bbox_z_ub = bbox_z_lb + self.patch_size[2]
+                    selected_bbox = [bbox_x_lb, bbox_y_lb, bbox_z_lb]
+                    # Check bbox is in label area (1. general, 2. strict)
+                    #if not(is_between(bbox_x_lb, x_min, x_max, self.patch_size[0]) and is_between(bbox_y_lb, y_min, y_max, self.patch_size[1]) and is_between(bbox_z_lb, z_min, z_max, self.patch_size[2])):
+                    if not (is_between(bbox_x_lb, x_min-self.patch_size[0]/2, x_max+self.patch_size[0]/2, self.patch_size[0]) and is_between(bbox_y_lb, y_min-self.patch_size[1]/2, y_max+self.patch_size[1]/2, self.patch_size[1]) and is_between(bbox_z_lb, z_min-self.patch_size[2]/2, z_max+self.patch_size[2]/2, self.patch_size[2])):
+                        if selected_bbox not in negative_selected: # 중복되는 패치 선택 방지
+                            negative_selected.append(selected_bbox)
+                            break
+                        else:
+                            continue
+                cnt=0
+                while len(positive_selected) < self.positive_size:
+                    cnt = cnt + 1
+                    if cnt > 100:
+                        print(f'ERROR: p repeated {cnt} {len(positive_selected)}/{self.positive_size}')
+                    if voxels_of_that_class is not None:
+                        selected_voxel = voxels_of_that_class[np.random.choice(len(voxels_of_that_class))]
+                        # selected voxel is center voxel. Subtract half the patch size to get lower bbox voxel.
+                        # Make sure it is within the bounds of lb and ub
+                        bbox_x_lb = max(lb_x, selected_voxel[0] - self.patch_size[0] // 2)
+                        bbox_y_lb = max(lb_y, selected_voxel[1] - self.patch_size[1] // 2)
+                        bbox_z_lb = max(lb_z, selected_voxel[2] - self.patch_size[2] // 2)
 
-            # whoever wrote this knew what he was doing (hint: it was me). We first crop the data to the region of the
-            # bbox that actually lies within the data. This will result in a smaller array which is then faster to pad.
-            # valid_bbox is just the coord that lied within the data cube. It will be padded to match the patch size
-            # later
-            valid_bbox_x_lb = max(0, bbox_x_lb)
-            valid_bbox_x_ub = min(shape[0], bbox_x_ub)
-            valid_bbox_y_lb = max(0, bbox_y_lb)
-            valid_bbox_y_ub = min(shape[1], bbox_y_ub)
-            valid_bbox_z_lb = max(0, bbox_z_lb)
-            valid_bbox_z_ub = min(shape[2], bbox_z_ub)
+                    selected_bbox = [bbox_x_lb, bbox_y_lb, bbox_z_lb]
+                    if selected_bbox not in positive_selected: # 중복되는 패치 선택 방지
+                        positive_selected.append(selected_bbox)
+                        break
+                    else:
+                        continue
+                #print(f'[p{len(positive_selected)}] [n{len(negative_selected)}]')
+                # Divide into Patch data & seg
+                for p in positive_selected:
+                    data[batch_idx], seg[batch_idx, 0] = self.crop_and_padding(case_all_data, shape, p)
+                    batch_idx = batch_idx + 1
+                for n in negative_selected:
+                    data[batch_idx], seg[batch_idx, 0] = self.crop_and_padding(case_all_data, shape, n)
+                    batch_idx = batch_idx + 1
+            else:
+                # if not force_fg then we can just sample the bbox randomly from lb and ub. Else we need to make sure we get
+                # at least one of the foreground classes in the patch
+                if not force_fg:
+                    bbox_x_lb = np.random.randint(lb_x, ub_x + 1)
+                    bbox_y_lb = np.random.randint(lb_y, ub_y + 1)
+                    bbox_z_lb = np.random.randint(lb_z, ub_z + 1)
+                else:
+                    # these values should have been precomputed
+                    if 'class_locations' not in properties.keys():
+                        raise RuntimeError("Please rerun the preprocessing with the newest version of nnU-Net!")
 
-            # At this point you might ask yourself why we would treat seg differently from seg_from_previous_stage.
-            # Why not just concatenate them here and forget about the if statements? Well that's because segneeds to
-            # be padded with -1 constant whereas seg_from_previous_stage needs to be padded with 0s (we could also
-            # remove label -1 in the data augmentation but this way it is less error prone)
-            case_all_data = np.copy(case_all_data[:, valid_bbox_x_lb:valid_bbox_x_ub,
-                                    valid_bbox_y_lb:valid_bbox_y_ub,
-                                    valid_bbox_z_lb:valid_bbox_z_ub])
-            if seg_from_previous_stage is not None:
-                seg_from_previous_stage = seg_from_previous_stage[:, valid_bbox_x_lb:valid_bbox_x_ub,
-                                          valid_bbox_y_lb:valid_bbox_y_ub,
-                                          valid_bbox_z_lb:valid_bbox_z_ub]
+                    # this saves us a np.unique. Preprocessing already did that for all cases. Neat.
+                    foreground_classes = np.array(
+                        [i for i in properties['class_locations'].keys() if len(properties['class_locations'][i]) != 0])
+                    foreground_classes = foreground_classes[foreground_classes > 0]
 
-            data[j] = np.pad(case_all_data[:-1], ((0, 0),
-                                                  (-min(0, bbox_x_lb), max(bbox_x_ub - shape[0], 0)),
-                                                  (-min(0, bbox_y_lb), max(bbox_y_ub - shape[1], 0)),
-                                                  (-min(0, bbox_z_lb), max(bbox_z_ub - shape[2], 0))),
-                             self.pad_mode, **self.pad_kwargs_data)
+                    if len(foreground_classes) == 0:
+                        # this only happens if some image does not contain foreground voxels at all
+                        selected_class = None
+                        voxels_of_that_class = None
+                        print('case does not contain any foreground classes', i)
+                    else:
+                        selected_class = np.random.choice(foreground_classes)
 
-            seg[j, 0] = np.pad(case_all_data[-1:], ((0, 0),
+                        voxels_of_that_class = properties['class_locations'][selected_class]
+
+                    if voxels_of_that_class is not None:
+                        selected_voxel = voxels_of_that_class[np.random.choice(len(voxels_of_that_class))]
+                        # selected voxel is center voxel. Subtract half the patch size to get lower bbox voxel.
+                        # Make sure it is within the bounds of lb and ub
+                        bbox_x_lb = max(lb_x, selected_voxel[0] - self.patch_size[0] // 2)
+                        bbox_y_lb = max(lb_y, selected_voxel[1] - self.patch_size[1] // 2)
+                        bbox_z_lb = max(lb_z, selected_voxel[2] - self.patch_size[2] // 2)
+                    else:
+                        # If the image does not contain any foreground classes, we fall back to random cropping
+                        bbox_x_lb = np.random.randint(lb_x, ub_x + 1)
+                        bbox_y_lb = np.random.randint(lb_y, ub_y + 1)
+                        bbox_z_lb = np.random.randint(lb_z, ub_z + 1)
+
+                bbox_x_ub = bbox_x_lb + self.patch_size[0]
+                bbox_y_ub = bbox_y_lb + self.patch_size[1]
+                bbox_z_ub = bbox_z_lb + self.patch_size[2]
+
+                # whoever wrote this knew what he was doing (hint: it was me). We first crop the data to the region of the
+                # bbox that actually lies within the data. This will result in a smaller array which is then faster to pad.
+                # valid_bbox is just the coord that lied within the data cube. It will be padded to match the patch size
+                # later
+                valid_bbox_x_lb = max(0, bbox_x_lb)
+                valid_bbox_x_ub = min(shape[0], bbox_x_ub)
+                valid_bbox_y_lb = max(0, bbox_y_lb)
+                valid_bbox_y_ub = min(shape[1], bbox_y_ub)
+                valid_bbox_z_lb = max(0, bbox_z_lb)
+                valid_bbox_z_ub = min(shape[2], bbox_z_ub)
+
+                # At this point you might ask yourself why we would treat seg differently from seg_from_previous_stage.
+                # Why not just concatenate them here and forget about the if statements? Well that's because segneeds to
+                # be padded with -1 constant whereas seg_from_previous_stage needs to be padded with 0s (we could also
+                # remove label -1 in the data augmentation but this way it is less error prone)
+                case_all_data = np.copy(case_all_data[:, valid_bbox_x_lb:valid_bbox_x_ub,
+                                        valid_bbox_y_lb:valid_bbox_y_ub,
+                                        valid_bbox_z_lb:valid_bbox_z_ub])
+                if seg_from_previous_stage is not None:
+                    seg_from_previous_stage = seg_from_previous_stage[:, valid_bbox_x_lb:valid_bbox_x_ub,
+                                            valid_bbox_y_lb:valid_bbox_y_ub,
+                                            valid_bbox_z_lb:valid_bbox_z_ub]
+
+                data[j] = np.pad(case_all_data[:-1], ((0, 0),
                                                     (-min(0, bbox_x_lb), max(bbox_x_ub - shape[0], 0)),
                                                     (-min(0, bbox_y_lb), max(bbox_y_ub - shape[1], 0)),
                                                     (-min(0, bbox_z_lb), max(bbox_z_ub - shape[2], 0))),
-                               'constant', **{'constant_values': -1})
-            if seg_from_previous_stage is not None:
-                seg[j, 1] = np.pad(seg_from_previous_stage, ((0, 0),
-                                                             (-min(0, bbox_x_lb),
-                                                              max(bbox_x_ub - shape[0], 0)),
-                                                             (-min(0, bbox_y_lb),
-                                                              max(bbox_y_ub - shape[1], 0)),
-                                                             (-min(0, bbox_z_lb),
-                                                              max(bbox_z_ub - shape[2], 0))),
-                                   'constant', **{'constant_values': 0})
+                                self.pad_mode, **self.pad_kwargs_data)
+
+                seg[j, 0] = np.pad(case_all_data[-1:], ((0, 0),
+                                                        (-min(0, bbox_x_lb), max(bbox_x_ub - shape[0], 0)),
+                                                        (-min(0, bbox_y_lb), max(bbox_y_ub - shape[1], 0)),
+                                                        (-min(0, bbox_z_lb), max(bbox_z_ub - shape[2], 0))),
+                                'constant', **{'constant_values': -1})
+                if seg_from_previous_stage is not None:
+                    seg[j, 1] = np.pad(seg_from_previous_stage, ((0, 0),
+                                                                (-min(0, bbox_x_lb),
+                                                                max(bbox_x_ub - shape[0], 0)),
+                                                                (-min(0, bbox_y_lb),
+                                                                max(bbox_y_ub - shape[1], 0)),
+                                                                (-min(0, bbox_z_lb),
+                                                                max(bbox_z_ub - shape[2], 0))),
+                                    'constant', **{'constant_values': 0})
 
         return {'data': data, 'seg': seg, 'properties': case_properties, 'keys': selected_keys}
 
