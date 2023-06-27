@@ -452,7 +452,7 @@ class NetworkTrainer(object):
                         tbar.set_postfix(loss=l)
                         train_losses_epoch.append(l)
             else:
-                for _ in range(self.num_batches_per_epoch):
+                for i in range(self.num_batches_per_epoch):
                     l = self.run_iteration(self.tr_gen, True)
                     train_losses_epoch.append(l)
 

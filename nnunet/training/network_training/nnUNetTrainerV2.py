@@ -86,7 +86,8 @@ class nnUNetTrainerV2(nnUNetTrainer):
             weights = weights / weights.sum()
             self.ds_loss_weights = weights
             # now wrap the loss
-            self.loss = MultipleOutputLoss2(self.loss, self.ds_loss_weights)
+            self.seg_loss = MultipleOutputLoss2(self.loss, self.ds_loss_weights)
+            self.cls_loss = nn.BCEWithLogitsLoss()
             ################# END ###################
 
             self.folder_with_preprocessed_data = join(self.dataset_directory, self.plans['data_identifier'] +
@@ -118,11 +119,15 @@ class nnUNetTrainerV2(nnUNetTrainer):
             else:
                 pass
 
-            # self.initialize_network()
-            from nnunet.network_architecture.static_UNet import Static_UNet
-            self.network = Static_UNet(num_classes=self.num_classes, in_channels=self.num_input_channels).to('cuda')
+            ####MTL Version####
+            from nnunet.network_architecture.up_MTL import Up_MTL
+            self.network = Up_MTL(num_classes=self.num_classes, in_channels=self.num_input_channels).to('cuda')
             self.initialize_optimizer_and_scheduler()
-            # assert isinstance(self.network, (SegmentationNetwork, nn.DataParallel))
+            
+            ####Original Version####
+            #self.initialize_network()
+            #self.initialize_optimizer_and_scheduler()
+            #assert isinstance(self.network, (SegmentationNetwork, nn.DataParallel))
         else:
             self.print_to_log_file('self.was_initialized is True, not running self.initialize again')
         self.was_initialized = True
@@ -242,35 +247,142 @@ class nnUNetTrainerV2(nnUNetTrainer):
             target = to_cuda(target)
 
         self.optimizer.zero_grad()
+        cls_target = list()
+        cls_target_type = list()
+        first_unique = list()
+        second_unique = list()
+        new_first_unique = list()
+        new_second_unique = list()
 
         if self.fp16:
-            with autocast():
+            if type(self.network).__name__ == 'Up_MTL':
+                with autocast():
+                    cls_output, output = self.network(data)
+
+                    assert 0 < len(torch.unique(target[0])) < 3
+                    
+                    first_unique = torch.Tensor.tolist(torch.unique(target[0][0]))
+                    first_unique_size = len(first_unique)
+                    
+                    if first_unique_size == 1 or first_unique_size ==2:
+                        first_label_size = first_unique_size  #2 -> tumor, 1-> normal                    
+                    else:
+                        for i in first_unique: #target 값에 label 0 값이 지수표현식으로 표현될 때가 있음 ex) 2.1857e-38
+                            if i < 0.4:
+                                i = 0
+                                new_first_unique.append(0)
+                            else:
+                                i = 1
+                                new_first_unique.append(1)
+                            
+                            first_label_size = set(new_first_unique) 
+                                
+                    second_unique = torch.Tensor.tolist(torch.unique(target[0][1]))
+                    second_unique_size = len(second_unique)
+                    if second_unique_size == 1 or second_unique_size ==2:
+                        second_label_size = second_unique_size #2 -> tumor, 1-> normal                    
+                    else:
+                        for j in second_unique: #target 값에 label 0 값이 지수표현식으로 표현될 때가 있음 ex) 2.1857e-38
+                            if j < 0.4:
+                                j = 0
+                                new_second_unique.append(0)
+                            else:
+                                j = 1
+                                new_second_unique.append(1)
+                                
+                            second_label_size = set(new_second_unique) 
+                                        
+                    cls_target_type.append(first_label_size)
+                    cls_target_type.append(second_label_size)  
+                    del data
+                    
+                    for i in cls_target_type:                    
+                        if i == 1:
+                            cls_target.append(0)
+                        elif i == 2:
+                            cls_target.append(1)
+                        else:
+                            print("check")
+                            print(data_dict['keys'][0])
+                            print(data_dict['keys'][1])
+                    
+                    cls_target = torch.Tensor(cls_target)#list -> tensor
+                    cls_target = cls_target.unsqueeze(1)#[2] -> [2, 1] : prediction 이 [2, 1] 형태로 뱉음
+                    cls_target = to_cuda(cls_target)
+                    
+                    seg_loss = self.seg_loss(output, target)
+                    cls_loss = self.cls_loss(cls_output, cls_target)
+                    alpha = 0.7
+                    loss = alpha*seg_loss + (1-alpha)*cls_loss
+                    
+                    cls_target_type.clear()
+                    new_first_unique.clear()
+                    
+                    if do_backprop:
+                        self.amp_grad_scaler.scale(loss).backward()
+                        self.amp_grad_scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+                        self.amp_grad_scaler.step(self.optimizer)
+                        self.amp_grad_scaler.update()
+            else:
+                with autocast():
+                    output = self.network(data)
+                    del data
+                    loss = self.seg_loss(output, target)
+                    
+                    if do_backprop:
+                        self.amp_grad_scaler.scale(loss).backward()
+                        self.amp_grad_scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+                        self.amp_grad_scaler.step(self.optimizer)
+                        self.amp_grad_scaler.update()
+                        
+        else:
+            if type(self.network).__name__ == 'Up_MTL':
+                cls_output, output = self.network(data)
+                del data
+                first_label_size = torch.unique(target[0][0]).size()[0] #2 -> tumor, 1-> normal
+                second_label_size = torch.unique(target[0][1]).size()[0] #2 -> tumor, 1-> normal
+                cls_target_type.append(first_label_size)
+                cls_target_type.append(second_label_size)  
+                
+                for i in cls_target_type:                    
+                    if i == 1:
+                        cls_target.append(0)
+                    elif i == 2:
+                        cls_target.append(1)
+                
+                cls_target = torch.Tensor(cls_target)#list -> tensor
+                cls_target = cls_target.unsqueeze(1)#[2] -> [2, 1] : prediction 이 [2, 1] 형태로 뱉음
+                cls_target = to_cuda(cls_target)
+                
+                seg_loss = self.seg_loss(output, target)
+                cls_loss = self.cls_loss(cls_output, cls_target)
+                alpha = 0.7
+                loss = alpha*seg_loss + (1-alpha)*cls_loss
+                
+                cls_target_type.clear()
+
+                if do_backprop:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+                    self.optimizer.step()
+            else:
                 output = self.network(data)
                 del data
-                l = self.loss(output, target)
+                loss = self.seg_loss(output, target)
 
-            if do_backprop:
-                self.amp_grad_scaler.scale(l).backward()
-                self.amp_grad_scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-                self.amp_grad_scaler.step(self.optimizer)
-                self.amp_grad_scaler.update()
-        else:
-            output = self.network(data)
-            del data
-            l = self.loss(output, target)
-
-            if do_backprop:
-                l.backward()
-                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-                self.optimizer.step()
-
+                if do_backprop:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+                    self.optimizer.step()
+                    
         if run_online_evaluation:
             self.run_online_evaluation(output, target)
 
         del target
 
-        return l.detach().cpu().numpy()
+        return loss.detach().cpu().numpy()
 
     def do_split(self):
         """
