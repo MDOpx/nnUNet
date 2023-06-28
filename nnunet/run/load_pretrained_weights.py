@@ -14,7 +14,7 @@
 import torch
 
 
-def load_pretrained_weights(network, fname, verbose=False):
+def load_pretrained_weights(network, fname, verbose=False, load_only_encoders:bool=False):
     """
     THIS DOES NOT TRANSFER SEGMENTATION HEADS!
     """
@@ -37,7 +37,7 @@ def load_pretrained_weights(network, fname, verbose=False):
     model_dict = network.state_dict()
     ok = True
     for key, _ in model_dict.items():
-        if ('conv_blocks' in key):
+        if ('coder' in key):
             if (key in pretrained_dict) and (model_dict[key].shape == pretrained_dict[key].shape):
                 continue
             else:
@@ -46,8 +46,10 @@ def load_pretrained_weights(network, fname, verbose=False):
 
     # filter unnecessary keys
     if ok:
-        pretrained_dict = {k: v for k, v in pretrained_dict.items() if
-                           (k in model_dict) and (model_dict[k].shape == pretrained_dict[k].shape)}
+        if load_only_encoders:
+            pretrained_dict = {k: v for k, v in pretrained_dict.items() if 'encoder.encoders' in k}
+        else:
+            pretrained_dict = {k: v for k, v in pretrained_dict.items() if (k in model_dict) and (model_dict[k].shape == pretrained_dict[k].shape)}
         # 2. overwrite entries in the existing state dict
         model_dict.update(pretrained_dict)
         print("################### Loading pretrained weights from file ", fname, '###################')
